@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="ja"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
+<title>Mac リモートデスクトップ</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111;color:white;font:14px system-ui;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
+video{display:block;max-width:100vw;max-height:100%;width:auto;height:auto;object-fit:contain;touch-action:none;user-select:none;-webkit-touch-callout:none}
+aside{position:fixed;right:max(8px,env(safe-area-inset-right));top:max(8px,env(safe-area-inset-top));max-width:calc(100% - 32px);background:#171717f2;border-radius:8px;font-size:13px;font-variant-numeric:tabular-nums}
+aside.compact{background:#171717cf;border-radius:100px}
+#statusToggle{display:flex;align-items:center;gap:8px;min-width:32px;min-height:32px;margin:0;padding:0 10px;border:0;border-radius:inherit;background:transparent;color:inherit;font:inherit;cursor:pointer}
+aside.compact #statusToggle{justify-content:center;padding:0}
+aside.compact #status{position:absolute;width:1px;height:1px;clip-path:inset(50%);overflow:hidden;white-space:nowrap}
+#statusDot{width:8px;height:8px;flex:none;border-radius:50%;background:#ffcd74}
+aside.connected #statusDot{background:#75da9a}
+#statusDetails{padding:0 10px 10px}
+#stats:not(:empty){margin-bottom:8px}
+#statusDetails button{min-height:32px;margin:0}
+#calibration{border:0;margin:8px 0 0;padding:0}
+#calibration legend{padding:0;margin-bottom:4px}
+#calibration label{display:inline-flex;align-items:center;gap:4px;margin:0 4px 4px 0}
+#calibration input{width:5em;min-height:32px;font:16px system-ui}
+button{margin-left:6px;padding:5px}
+html,body{overscroll-behavior:none}body{touch-action:none}
+main{flex:1;min-height:0;display:grid;grid-template: minmax(0,1fr) / minmax(0,1fr);place-items:center;overflow:hidden}
+video{transform-origin:0 0}
+footer{background:#222;padding:5px max(6px,env(safe-area-inset-right)) env(safe-area-inset-bottom) max(6px,env(safe-area-inset-left))}
+footer button{min-height:32px;margin:2px}
+button[aria-pressed=true]{background:#1666b5;color:white}
+textarea{width:100%;font:16px system-ui;touch-action:auto}
+#panel{max-height:40dvh;overflow:auto;touch-action:pan-y}
+#ring{position:fixed;width:36px;height:36px;margin:-18px 0 0 -18px;border:2px solid #75da9a;border-radius:50%;pointer-events:none;z-index:5;opacity:0}
+#ring.show{animation:ringfade .4s ease-out}
+@keyframes ringfade{0%{opacity:.95;transform:scale(.6)}100%{opacity:0;transform:scale(1.25)}}
+</style>
+<main><video playsinline autoplay muted tabindex="-1" aria-label="Mac の映像"></video></main>
+<div id="ring" hidden></div>
+<footer><button id="mode" type="button" aria-pressed="false">マウスモード</button><button id="captureKeys" type="button" aria-pressed="false" hidden>直接キー入力</button><button id="toggle" aria-expanded="false" aria-controls="panel">キーボード</button><button id="clipOpen" disabled>テキスト転送</button><button id="zoomReset" hidden>等倍に戻す</button>
+<section id="panel" hidden><div id="modifiers"></div><div id="keys"></div><div id="shortcuts"></div>
+<textarea rows="1" aria-label="Mac への文字入力" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea></section></footer>
+<dialog id="clip"><form method="dialog"><label>転送するテキスト<textarea id="draft" rows="5" maxlength="8000"></textarea></label>
+<button type="button" id="paste">Mac に入力</button><button type="button" id="readClip">Mac のコピーを取得</button>
+<button>閉じる</button><div role="status" id="notice"></div></form></dialog>
+<aside id="connection"><button id="statusToggle" type="button" aria-expanded="true" aria-controls="statusDetails"><span id="statusDot" aria-hidden="true"></span><span id="status" role="status">接続中</span></button>
+<div id="statusDetails"><div id="stats"></div><button id="retry" type="button">再接続</button>
+<fieldset id="calibration"><legend>カーソル補正（pt）</legend><label>横 <input id="offsetX" type="number" min="-100" max="100" step="1" value="0"></label><label>縦 <input id="offsetY" type="number" min="-100" max="100" step="1" value="0"></label></fieldset></div></aside>
+<script>
+const video = document.querySelector('video'), statusText = document.querySelector('#status');
+let ws, pc, rtt, previous, display;
+function send(m) { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m)); }
+const points = new Map();
+const clamp = (n,min,max) => Math.max(min,Math.min(max,n));
+const distance = (a,b) => Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+function stored(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function remember(key,value) {
+  try { localStorage.setItem(key,value); } catch {}
+}
+const modeButton=document.querySelector('#mode'), captureButton=document.querySelector('#captureKeys');
+let mouseMode=stored('inputMode')==='mouse', captureKeys=false;
+function showMode() {
+  modeButton.textContent=mouseMode?'マウスモード':'タッチモード';
+  modeButton.setAttribute('aria-label',mouseMode?'マウスモード · タッチモードに切替':'タッチモード · マウスモードに切替');
+  modeButton.setAttribute('aria-pressed',String(mouseMode));
+  captureButton.hidden=!mouseMode;
+  captureButton.setAttribute('aria-pressed',String(captureKeys));
+}
+function restoreVideoFocus() {
+  if (mouseMode && captureKeys && !document.querySelector('#clip').open) video.focus({preventScroll:true});
+}
+modeButton.onclick=()=>{
+  release();
+  mouseMode=!mouseMode;
+  if (!mouseMode) captureKeys=false;
+  remember('inputMode',mouseMode?'mouse':'touch');
+  showMode();
+};
+captureButton.onclick=()=>{
+  captureKeys=!captureKeys;
+  showMode();
+  restoreVideoFocus();
+};
+showMode();
+
+function pointOffset(axis) {
+  const key='offset'+axis;
+  const field=document.getElementById(key);
+  const saved=stored(key);
+  let value=clamp(Math.round(Number(saved===null?(axis==='X'?-9:6):saved) || 0),-100,100);
+  field.value=value;
+  field.onchange=()=>{
+    value=clamp(Math.round(field.valueAsNumber || 0),-100,100);
+    field.value=value;
+    remember(key,value);
+  };
+  return ()=>value;
+}
+const offsetX=pointOffset('X'), offsetY=pointOffset('Y');
+function contentRect(rect) {
+  const fit=Math.min(rect.width/video.videoWidth,rect.height/video.videoHeight);
+  const width=video.videoWidth*fit, height=video.videoHeight*fit;
+  return {left:rect.left+(rect.width-width)/2,top:rect.top+(rect.height-height)/2,width,height};
+}
+function inputReady() {
+  return video.videoWidth>0 && video.videoHeight>0 && pc?.connectionState==='connected';
+}
+function move(e,allowOutside=true) {
+  if (!inputReady()) return false;
+  const r=contentRect(video.getBoundingClientRect());
+  if (!(r.width>0 && r.height>0)) return false;
+  const x=(e.clientX-r.left)/r.width, y=(e.clientY-r.top)/r.height;
+  if (!allowOutside && (x<0 || x>1 || y<0 || y>1)) return false;
+  send({t:'move',x:clamp(x+(display?offsetX()/display.width:0),0,1),
+    y:clamp(y+(display?offsetY()/display.height:0),0,1)});
+  return true;
+}
+let scale=1, appliedScale=1, tx=0, ty=0, held=null, gesture=null, pending=null;
+function transform() {
+  document.querySelector('#zoomReset').hidden=scale<=1;
+  const stage=video.parentElement.getBoundingClientRect();
+  const rect=video.getBoundingClientRect();
+  const content=video.videoWidth && video.videoHeight?contentRect(rect):rect;
+  const overflowX=Math.max(0,(content.width/appliedScale*scale-stage.width)/2);
+  const overflowY=Math.max(0,(content.height/appliedScale*scale-stage.height)/2);
+  const centerX=rect.width/appliedScale*(1-scale)/2, centerY=rect.height/appliedScale*(1-scale)/2;
+  tx=clamp(tx,centerX-overflowX,centerX+overflowX);
+  ty=clamp(ty,centerY-overflowY,centerY+overflowY);
+  video.style.transform='translate('+tx+'px,'+ty+'px) scale('+scale+')';
+  appliedScale=scale;
+}
+const resize=new ResizeObserver(transform);
+resize.observe(video.parentElement);
+resize.observe(video);
+video.onresize=transform;
+let pressTimer=null, pressOrigin=null, longPressed=false;
+function disarmLongPress() { if (pressTimer) clearTimeout(pressTimer); pressTimer=null; }
+function armLongPress(p) {
+  disarmLongPress(); longPressed=false;
+  pressOrigin={clientX:p.clientX,clientY:p.clientY};
+  pressTimer=setTimeout(fireLongPress,550);
+}
+function fireLongPress() {
+  pressTimer=null;
+  if (held!==0 || !pressOrigin) return;
+  longPressed=true;
+  lift();
+  move(pressOrigin);
+  send({t:'down',b:1}); send({t:'up',b:1});
+  const ring=document.querySelector('#ring');
+  ring.style.left=pressOrigin.clientX+'px'; ring.style.top=pressOrigin.clientY+'px';
+  ring.hidden=false; ring.classList.remove('show'); void ring.offsetWidth; ring.classList.add('show');
+}
+function press(p) { move(p); held=p.button===2 && p.pointerType==='mouse'?1:0; send({t:'down',b:held}); if (held===0 && p.pointerType!=='mouse') armLongPress(p); }
+function lift() { disarmLongPress(); if (held!==null) send({t:'up',b:held}); held=null; }
+function finishTap(deliver) {
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  if (deliver) { press(pending.event); lift(); }
+  pending=null;
+}
+function release() {
+  finishTap(false); lift(); longPressed=false;
+  for (const p of points.values()) clearTimeout(p.timer);
+  points.clear(); gesture=null;
+  releaseMouse();
+}
+function pair() {
+  const [a,b]=points.values();
+  return {clientX:(a.last.clientX+b.last.clientX)/2,clientY:(a.last.clientY+b.last.clientY)/2,
+    span:distance(a.last,b.last)};
+}
+function startDrag(p) {
+  if (!p.deferred) return;
+  finishTap(true); clearTimeout(p.timer); p.deferred=false; press(p.start);
+}
+let mousePointer=null, mouseButtons=0, mousePosition=null, rightPointerClick=null, wheelX=0, wheelY=0;
+function releaseMouse() {
+  for (const b of [0,1]) if (mouseButtons & (1<<b)) send({t:'up',b});
+  const pointer=mousePointer;
+  mousePointer=null;
+  mouseButtons=0;
+  mousePosition=null;
+  rightPointerClick=null;
+  wheelX=wheelY=0;
+  if (pointer!==null && video.hasPointerCapture(pointer)) video.releasePointerCapture(pointer);
+}
+function mouseInput(e) {
+  if (!inputReady() || (mousePointer!==null && e.pointerId!==mousePointer)) return;
+  let buttons=e.buttons & 3;
+  if (e.type==='pointerdown') {
+    if (![0,2].includes(e.button)) return;
+    buttons|=e.button===2?2:1;
+  }
+  if (e.type==='pointermove' && !mouseButtons && buttons) return; // A press that began outside the video.
+  const moved=!mousePosition || e.clientX!==mousePosition.clientX || e.clientY!==mousePosition.clientY;
+  if (!mouseButtons || moved) {
+    if (!move(e,mouseButtons!==0)) return;
+    mousePosition={clientX:e.clientX,clientY:e.clientY};
+  }
+  if (buttons && mousePointer===null) {
+    mousePointer=e.pointerId;
+    video.setPointerCapture(e.pointerId);
+    restoreVideoFocus();
+  }
+  for (const b of [0,1]) {
+    const bit=1<<b;
+    if (!((mouseButtons ^ buttons) & bit)) continue;
+    const down=Boolean(buttons & bit);
+    send({t:down?'down':'up',b});
+    if (b===1) {
+      if (down) rightPointerClick={start:mousePosition,end:null,expires:Infinity,seen:false};
+      else if (rightPointerClick) {
+        rightPointerClick.end=mousePosition;
+        rightPointerClick.expires=performance.now()+750;
+      }
+    }
+  }
+  mouseButtons=buttons;
+  if (!buttons) mousePointer=null;
+}
+video.onpointerdown=e=>{
+  if (mouseMode) return mouseInput(e);
+  if (!inputReady() || ![0,2].includes(e.button)) return;
+  video.setPointerCapture(e.pointerId);
+  const p={start:e,last:e,deferred:false};
+  points.set(e.pointerId,p);
+  if (gesture) { gesture.mode='cancel'; return; }
+  if (points.size===2) {
+    for (const point of points.values()) { startDrag(point); clearTimeout(point.timer); }
+    finishTap(true); lift();
+    const center=pair(), rect=video.getBoundingClientRect();
+    gesture={mode:'waiting',time:performance.now(),center,last:center,travel:0,scale,
+      anchorX:(center.clientX-rect.left)/scale,anchorY:(center.clientY-rect.top)/scale,rx:0,ry:0};
+  } else if (scale>1.02 && e.pointerType==='touch') {
+    if (pending && distance(pending.event,e)>24) finishTap(true);
+    if (pending) clearTimeout(pending.timer);
+    p.deferred=true; p.timer=setTimeout(()=>startDrag(p),300);
+  } else { finishTap(true); press(e); }
+};
+function update(p,e) {
+  const step=distance(p.last,e);
+  p.last=e;
+  if (!gesture) {
+    if (p.deferred && distance(p.start,e)>=10) startDrag(p);
+    if (pressTimer && pressOrigin && distance(pressOrigin,e)>=10) disarmLongPress();
+    if (!p.deferred && !longPressed) move(e);
+    return;
+  }
+  const g=gesture;
+  g.travel+=step;
+  if (points.size!==2 || g.mode==='cancel' || g.ending) return;
+  const c=pair();
+  if (Math.abs(c.span-g.center.span)>24) g.mode='zoom';
+  if (g.mode==='zoom') {
+    const rect=video.getBoundingClientRect();
+    scale=clamp(g.scale*c.span/Math.max(1,g.center.span),1,4);
+    tx+=c.clientX-rect.left-g.anchorX*scale;
+    ty+=c.clientY-rect.top-g.anchorY*scale;
+    transform();
+  } else {
+    if (g.mode==='waiting' && distance(c,g.center)<5) return;
+    g.mode='drag';
+    const x=c.clientX-g.last.clientX,y=c.clientY-g.last.clientY;
+    if (scale>1.02) { tx+=x; ty+=y; transform(); }
+    else {
+      g.rx+=x/12; g.ry+=y/12;
+      const dx=clamp(Math.trunc(g.rx),-120,120),dy=clamp(Math.trunc(g.ry),-120,120);
+      if (dx || dy) { send({t:'wheel',dx,dy}); g.rx-=dx; g.ry-=dy; }
+    }
+  }
+  g.last=c;
+}
+video.onpointermove=e=>{
+  if (mouseMode) return mouseInput(e);
+  const p=points.get(e.pointerId);
+  if (!p) return;
+  for (const sample of e.getCoalescedEvents?.() || []) update(p,sample);
+  update(p,e);
+};
+video.onpointerup=e=>{
+  if (mouseMode) { if (mousePointer===e.pointerId) mouseInput(e); return; }
+  const p=points.get(e.pointerId);
+  if (!p) return;
+  clearTimeout(p.timer); update(p,e);
+  points.delete(e.pointerId);
+  if (gesture) {
+    gesture.ending=true;
+    if (!points.size) {
+      if (gesture.mode==='waiting' && gesture.travel<10 && performance.now()-gesture.time<=300) {
+        move(gesture.last); send({t:'down',b:1}); send({t:'up',b:1});
+      }
+      gesture=null;
+    }
+  } else if (p.deferred) {
+    if (pending) { finishTap(false); scale=1; tx=ty=0; transform(); }
+    else pending={event:e,timer:setTimeout(()=>finishTap(true),300)};
+  } else lift();
+};
+video.onpointercancel=video.onlostpointercapture=e=>{
+  if (points.has(e.pointerId) || mousePointer===e.pointerId) release();
+};
+video.oncontextmenu=e=>{
+  e.preventDefault();
+  if (!mouseMode) return;
+  const click=rightPointerClick;
+  if ((mouseButtons & 2) || (click && !click.seen && performance.now()<=click.expires &&
+      (distance(e,click.start)<=8 || (click.end && distance(e,click.end)<=8)))) {
+    if (click) click.seen=true;
+    return; // Some browsers emit contextmenu before pointerup, others after.
+  }
+  if (move(e,false)) { send({t:'down',b:1}); send({t:'up',b:1}); }
+};
+video.addEventListener('wheel',e=>{
+  e.preventDefault();
+  if (!move(e,!mouseMode)) return;
+  const units=e.deltaMode;
+  if (!mouseMode) { send({t:'wheel',dy:-Math.sign(e.deltaY)*3,dx:-Math.sign(e.deltaX)*3}); return; }
+  const lines=(delta,pageSize)=>units===1?delta:delta*(units===2?pageSize:1)/40;
+  wheelX-=lines(e.deltaX,video.parentElement.clientWidth);
+  wheelY-=lines(e.deltaY,video.parentElement.clientHeight);
+  const dx=clamp(Math.trunc(wheelX),-120,120),dy=clamp(Math.trunc(wheelY),-120,120);
+  wheelX%=1;
+  wheelY%=1;
+  if (dx || dy) send({t:'wheel',dx,dy});
+},{passive:false});
+async function wake() {
+  if (pc?.connectionState==='connected' && !document.hidden) {
+    try { await navigator.wakeLock?.request('screen'); } catch {}
+  }
+}
+window.onblur=release;
+document.onvisibilitychange=()=>{
+  if (document.hidden) { clearTimeout(retryTimer); release(); }
+  else if (!ws || ws.readyState>=2) connect();
+  else wake();
+};
+window.onpageshow=e=>{ if (e.persisted) connect(); };
+window.onpagehide=()=>{ release(); ws?.close(); };
+const panel=document.querySelector('#panel'), field=panel.querySelector('textarea');
+const toggle=document.querySelector('#toggle');
+function fitViewport() {
+  if (window.visualViewport) document.body.style.height=window.visualViewport.height+'px';
+}
+window.visualViewport?.addEventListener('resize',fitViewport);
+fitViewport();
+toggle.onclick=()=>{
+  panel.hidden=!panel.hidden;
+  toggle.setAttribute('aria-expanded',String(!panel.hidden));
+  if (!panel.hidden) field.focus();
+  else restoreVideoFocus();
+};
+// DOM KeyboardEvent.code (US layout) to macOS virtual key codes.
+const keyCodes=new Map(Object.entries({
+  KeyA:0,KeyB:11,KeyC:8,KeyD:2,KeyE:14,KeyF:3,KeyG:5,KeyH:4,KeyI:34,KeyJ:38,KeyK:40,
+  KeyL:37,KeyM:46,KeyN:45,KeyO:31,KeyP:35,KeyQ:12,KeyR:15,KeyS:1,KeyT:17,KeyU:32,
+  KeyV:9,KeyW:13,KeyX:7,KeyY:16,KeyZ:6,
+  Digit0:29,Digit1:18,Digit2:19,Digit3:20,Digit4:21,Digit5:23,Digit6:22,Digit7:26,Digit8:28,Digit9:25,
+  Minus:27,Equal:24,BracketLeft:33,BracketRight:30,Backslash:42,Semicolon:41,Quote:39,
+  Backquote:50,Comma:43,Period:47,Slash:44,
+  Space:49,Enter:36,Tab:48,Escape:53,Backspace:51,Delete:117,ArrowLeft:123,ArrowRight:124,
+  ArrowDown:125,ArrowUp:126,Home:115,End:119,PageUp:116,PageDown:121,
+  F1:122,F2:120,F3:99,F4:118,F5:96,F6:97,F7:98,F8:100,F9:101,F10:109,F11:103,F12:111,
+  Numpad0:82,Numpad1:83,Numpad2:84,Numpad3:85,Numpad4:86,Numpad5:87,Numpad6:88,
+  Numpad7:89,Numpad8:91,Numpad9:92,NumpadDecimal:65,NumpadAdd:69,NumpadSubtract:78,
+  NumpadMultiply:67,NumpadDivide:75,NumpadEqual:81,NumpadEnter:76
+}));
+const symbolCodes=[
+  ['!','Digit1'],['@','Digit2'],['#','Digit3'],['$','Digit4'],['%','Digit5'],['^','Digit6'],
+  ['&','Digit7'],['*','Digit8'],['(','Digit9'],[')','Digit0'],['-_','Minus'],['=+','Equal'],
+  ['[{','BracketLeft'],[']}','BracketRight'],['\\|','Backslash'],[';:','Semicolon'],
+  ["'\"",'Quote'],[String.fromCharCode(96)+'~','Backquote'],[',<','Comma'],['.>','Period'],['/?','Slash'],[' ','Space']
+];
+const symbolKeys=new Map(symbolCodes.flatMap(([chars,code])=>Array.from(chars,char=>[char,code])));
+function virtualKey(event) {
+  if (keyCodes.has(event.code)) return keyCodes.get(event.code);
+  const k=event.key;
+  if (/^[a-z]$/i.test(k)) return keyCodes.get('Key'+k.toUpperCase());
+  if (/^[0-9]$/.test(k)) return keyCodes.get('Digit'+k);
+  return keyCodes.get(symbolKeys.get(k) ?? k);
+}
+document.addEventListener('keydown',e=>{
+  if (!mouseMode || !captureKeys || !inputReady() || e.defaultPrevented || e.isComposing ||
+      e.key==='Process' || e.key==='Dead' || e.keyCode===229 || clip.open ||
+      e.target.closest?.('input,textarea,select,button,a[href],[contenteditable]')) return;
+  const code=virtualKey(e);
+  if (code===undefined) return;
+  const mods=[];
+  if (e.metaKey) mods.push('cmd');
+  if (e.altKey) mods.push('opt');
+  if (e.ctrlKey) mods.push('ctrl');
+  if (e.shiftKey) mods.push('shift');
+  e.preventDefault();
+  send({t:'key',code,mods});
+});
+const modifiers=new Set();
+function key(code,extra=[]) {
+  send({t:'key',code,mods:[...new Set([...extra,...modifiers])]});
+  modifiers.clear();
+  for (const b of panel.querySelectorAll('[aria-pressed]')) b.setAttribute('aria-pressed','false');
+}
+function addButton(row,label,action) {
+  const b=document.createElement('button');
+  b.textContent=label;
+  b.onpointerdown=e=>e.preventDefault();
+  b.onclick=()=>action(b);
+  document.getElementById(row).append(b);
+  return b;
+}
+for (const label of ['Cmd','Opt','Ctrl','Shift']) {
+  const mod=label.toLowerCase();
+  addButton('modifiers',label,b=>{
+    if (modifiers.has(mod)) modifiers.delete(mod); else modifiers.add(mod);
+    b.setAttribute('aria-pressed',String(modifiers.has(mod)));
+  }).setAttribute('aria-pressed','false');
+}
+for (const [label,code] of Object.entries({Esc:53,Tab:48,Enter:36,Del:51,Space:49,'←':123,'↑':126,'↓':125,'→':124,Home:115,End:119}))
+  addButton('keys',label,()=>key(code));
+for (const [label,code] of Object.entries({A:0,C:8,X:7,V:9,Z:6,S:1,Q:12,Tab:48}))
+  addButton('shortcuts','⌘'+label,()=>key(code,['cmd']));
+for (const [label,code,mods] of [
+  ['Spotlight',49,['cmd']], ['Mission Control',126,['ctrl']], ['範囲撮影',21,['cmd','shift']]
+]) addButton('shortcuts',label,()=>key(code,mods));
+
+document.querySelector('#zoomReset').onclick=()=>{ release(); scale=1; tx=ty=0; transform(); };
+const clip=document.querySelector('#clip'), draft=document.querySelector('#draft');
+const clipOpen=document.querySelector('#clipOpen'), readClip=document.querySelector('#readClip');
+const notice=document.querySelector('#notice');
+let discardClipboard=false;
+clipOpen.onclick=()=>clip.showModal();
+clip.onclose=()=>{ discardClipboard=true; draft.value=''; notice.textContent=''; restoreVideoFocus(); };
+document.querySelector('#paste').onclick=()=>{
+  if (!draft.value || pc?.connectionState!=='connected') return;
+  if (draft.value.length>8000) { notice.textContent='入力は一度に8000文字までです'; return; }
+  text(draft.value.replace(/\r\n?/g,'\n'));
+  clip.close();
+};
+readClip.onclick=()=>{
+  if (draft.value && !confirm('入力欄を Mac のコピー内容で置き換えますか？')) return;
+  discardClipboard=false;
+  readClip.disabled=true;
+  notice.textContent='取得中';
+  send({t:'clipboard'});
+};
+function text(s) {
+  let chunk='';
+  for (const char of s) {
+    if (chunk.length+char.length>2000) { send({t:'text',s:chunk}); chunk=''; }
+    chunk+=char;
+  }
+  if (chunk) send({t:'text',s:chunk});
+}
+let composing=false, committed=null, handled=false, commitTimer;
+field.addEventListener('compositionstart',()=>{ composing=true; committed=null; handled=false; });
+field.addEventListener('compositionend',e=>{
+  composing=false;
+  committed=e.data;
+  text(e.data || '');
+  field.value='';
+  clearTimeout(commitTimer);
+  commitTimer=setTimeout(()=>{ committed=null; },0);
+});
+function ime(e) { return composing || e.isComposing || e.inputType==='insertCompositionText'; }
+function duplicate(e) {
+  return e.inputType==='insertFromComposition' ||
+    (committed!==null && e.inputType==='insertText' && e.data===committed);
+}
+field.onbeforeinput=e=>{
+  handled=false;
+  if (ime(e)) return;
+  if (!duplicate(e)) {
+    switch (e.inputType) {
+      case 'insertText': if (e.data==null) return; text(e.data); break;
+      case 'insertLineBreak': case 'insertParagraph': key(36); break;
+      case 'deleteContentBackward': if (field.value) return; key(51); break;
+      default: return;
+    }
+  }
+  if (e.cancelable) e.preventDefault(); else handled=true;
+  field.value='';
+};
+field.oninput=e=>{
+  if (ime(e)) return;
+  if (!handled && !duplicate(e)) {
+    if (e.inputType==='insertLineBreak' || e.inputType==='insertParagraph') key(36);
+    else if (e.inputType.startsWith('delete')) return;
+    else text(field.value || e.data || '');
+  }
+  handled=false; field.value='';
+};
+const connection=document.querySelector('#connection'), statusToggle=document.querySelector('#statusToggle');
+const statusDetails=document.querySelector('#statusDetails'), stats=document.querySelector('#stats');
+let compactTimer;
+function expandStatus(expanded) {
+  statusDetails.hidden=!expanded;
+  connection.classList.toggle('compact',!expanded);
+  statusToggle.setAttribute('aria-expanded',String(expanded));
+}
+function connectionStatus(label,connected=false) {
+  clearTimeout(compactTimer);
+  statusText.textContent=label;
+  connection.classList.toggle('connected',connected);
+  expandStatus(true);
+  if (connected) compactTimer=setTimeout(()=>{
+    if (!statusDetails.contains(document.activeElement)) expandStatus(false);
+  },3500);
+}
+statusToggle.onclick=()=>{
+  clearTimeout(compactTimer);
+  expandStatus(statusDetails.hidden);
+};
+let retryTimer, failures=0, lastPong;
+function scheduleRetry() {
+  clearTimeout(retryTimer);
+  if (document.hidden) { connectionStatus('切断'); return; }
+  const seconds=Math.min(20,2 ** Math.min(failures++,5));
+  connectionStatus('切断 · '+seconds+'秒後に再接続');
+  retryTimer=setTimeout(connect,seconds*1000);
+}
+function resetClipboard() {
+  clipOpen.disabled=true;
+  clip.close();
+  readClip.disabled=false;
+}
+function connect() {
+  clearTimeout(retryTimer);
+  resetClipboard();
+  lastPong=performance.now();
+  release();
+  ws?.close();
+  pc?.close();
+  video.srcObject = null;
+  rtt = previous = display = undefined;
+  stats.textContent = '';
+  connectionStatus('接続中');
+  const socket = ws = new WebSocket('ws://' + location.host + '/session', 'tailscale-remote-desktop');
+  let peer;
+  const handshakeTimer=setTimeout(()=>socket.close(),30000);
+  socket.onclose = () => {
+    clearTimeout(handshakeTimer);
+    peer?.close();
+    if (ws !== socket) return;
+    release();
+    pc=null;
+    video.srcObject=null;
+    resetClipboard();
+    scheduleRetry();
+    stats.textContent = '';
+  };
+  socket.onmessage = async e => {
+    if (ws !== socket) return;
+    try {
+      const m = JSON.parse(e.data);
+      if (m.t === 'display') { display=m; return; }
+      if (m.t === 'clipboard') {
+        readClip.disabled=false;
+        if (!clip.open || discardClipboard) return;
+        if (m.text===null) { notice.textContent='取得失敗（上限64 KiB）'; return; }
+        draft.value=m.text;
+        draft.focus(); draft.select();
+        notice.textContent=m.text ? '選択した文字をコピーできます' : 'テキストは空です';
+        return;
+      }
+      if (m.t === 'pong') { lastPong=performance.now(); rtt = Math.round(performance.now()-m.id); return; }
+      if (m.t !== 'offer') return;
+      peer = pc = new RTCPeerConnection({iceServers:[]});
+      peer.ontrack = e => { if (ws === socket) video.srcObject = new MediaStream([e.track]); };
+      peer.onconnectionstatechange = () => {
+        if (ws !== socket || socket.readyState!==1) return;
+        const state=peer.connectionState;
+        clipOpen.disabled=state !== 'connected';
+        if (state === 'connected') {
+          clearTimeout(handshakeTimer); failures=0; wake();
+          connectionStatus('接続済み',true);
+        } else {
+          release();
+          stats.textContent='';
+          connectionStatus(state === 'connecting' || state === 'new' ? '接続中' : '切断');
+          if (state === 'failed') socket.close();
+        }
+      };
+      peer.onicecandidate = e => {
+        if (!e.candidate && ws === socket && socket.readyState === 1)
+          send({t:'answer',sdp:peer.localDescription.sdp});
+      };
+      await peer.setRemoteDescription({type:'offer',sdp:m.sdp});
+      await peer.setLocalDescription(await peer.createAnswer());
+    } catch (err) { console.error(err); socket.close(); }
+  };
+}
+setInterval(async () => {
+  if (!document.hidden && ws?.readyState===1 && performance.now()-lastPong>20000) ws.close();
+  const peer = pc;
+  send({t:'ping', id:performance.now()});
+  if (peer?.connectionState !== 'connected') return;
+  try {
+    const report = await peer.getStats();
+    if (peer !== pc) return;
+    for (const s of report.values()) {
+      if (s.type !== 'inbound-rtp' || (s.kind ?? s.mediaType) !== 'video') continue;
+      let fps = s.framesPerSecond;
+      if (fps == null && previous && s.timestamp > previous.timestamp)
+        fps = (s.framesDecoded-previous.framesDecoded)*1000/(s.timestamp-previous.timestamp);
+      previous = s;
+      stats.textContent = (Number.isFinite(fps)?fps.toFixed(1):'–')+' fps · jitter '+
+        (Number.isFinite(s.jitter)?Math.round(s.jitter*1000):'–')+' ms · RTT '+(rtt??'–')+' ms';
+    }
+  } catch (err) { console.debug(err); }
+}, 1000);
+document.querySelector('#retry').onclick = connect;
+connect();
+</script></html>

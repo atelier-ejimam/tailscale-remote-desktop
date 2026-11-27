@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.viewer-token
+/Capture
+/Input
+.DS_Store
+*.bak
